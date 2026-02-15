@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ---- settings ----
 NODE_DIR="/opt/marzban-node"
 DATA_DIR="/var/lib/marzban-node"
 CERT_FILE="${DATA_DIR}/ssl_client_cert.pem"
+COMPOSE_FILE="${NODE_DIR}/docker-compose.yml"
 
 need_root() {
   if [[ "${EUID}" -ne 0 ]]; then
@@ -14,64 +16,55 @@ need_root() {
 
 install_pkgs() {
   apt-get update
-  apt-get install -y ca-certificates curl git nano jq ufw
+  apt-get install -y ca-certificates curl git nano
 }
 
 install_docker() {
-  # Ubuntu repo вариант (просто и стабильно)
-  apt-get install -y docker.io docker-compose-plugin
+  # официальный способ из доки (актуальный docker + docker compose)
+  if ! command -v docker >/dev/null 2>&1; then
+    curl -fsSL https://get.docker.com | sh
+  fi
   systemctl enable --now docker
+
+  # убедимся что есть docker compose (v2)
+  if ! docker compose version >/dev/null 2>&1; then
+    apt-get update
+    apt-get install -y docker-compose-plugin
+  fi
+
   docker compose version >/dev/null
 }
 
-clone_repo() {
-  if [[ -d "${NODE_DIR}" ]]; then
-    echo "Repo exists: ${NODE_DIR} (pulling latest)"
-    git -C "${NODE_DIR}" pull --ff-only
-  else
-    git clone https://github.com/Gozargah/Marzban-node "${NODE_DIR}"
-  fi
-}
-
 prepare_dirs() {
-  mkdir -p "${DATA_DIR}"
+  mkdir -p "${NODE_DIR}" "${DATA_DIR}"
 }
 
-patch_compose() {
-  local f="${NODE_DIR}/docker-compose.yml"
-  if [[ ! -f "${f}" ]]; then
-    echo "docker-compose.yml not found in ${NODE_DIR}"
-    exit 1
-  fi
+write_compose() {
+  # Эталон из официальной документации:
+  # - SSL_CLIENT_CERT_FILE включён
+  # - SERVICE_PROTOCOL=rest (для Marzban v0.4.4+ стабильнее)
+  # - SSL_CERT_FILE / SSL_KEY_FILE не используем для связи с панелью
+  cat > "${COMPOSE_FILE}" <<'YML'
+services:
+  marzban-node:
+    image: gozargah/marzban-node:latest
+    restart: always
+    network_mode: host
 
-  # 1) Убрать SSL_CERT_FILE / SSL_KEY_FILE (их просят удалить в доке)
-  #    Мы не удаляем, а комментируем, чтобы апдейты не ломались.
-  sed -i -E \
-    -e 's/^[[:space:]]*(SSL_CERT_FILE:)/# \1/' \
-    -e 's/^[[:space:]]*(SSL_KEY_FILE:)/# \1/' \
-    "${f}"
+    environment:
+      SSL_CLIENT_CERT_FILE: "/var/lib/marzban-node/ssl_client_cert.pem"
+      SERVICE_PROTOCOL: "rest"
 
-  # 2) Включить SSL_CLIENT_CERT_FILE (раскоментировать)
-  sed -i -E \
-    -e 's/^[[:space:]]*#[[:space:]]*(SSL_CLIENT_CERT_FILE:)/          \1/' \
-    "${f}"
-
-  # 3) Включить REST протокол (стабильнее для новых версий)
-  sed -i -E \
-    -e 's/^[[:space:]]*#[[:space:]]*(SERVICE_PROTOCOL:)/          \1/' \
-    "${f}"
-
-  # 4) Если вдруг строки отсутствуют (после обновлений репы) — добавим в environment
-  if ! grep -q 'SSL_CLIENT_CERT_FILE:' "${f}"; then
-    echo "SSL_CLIENT_CERT_FILE not found, please update script for new compose format."
-    exit 1
-  fi
+    volumes:
+      - /var/lib/marzban-node:/var/lib/marzban-node
+YML
 }
 
 read_cert() {
   echo
-  echo "Paste SSL CLIENT CERT (from Marzban Panel -> Node Settings -> Show Certificate)."
-  echo "When finished, press Ctrl+D on a new line."
+  echo "Paste SSL CLIENT CERT from Marzban Panel:"
+  echo "Node Settings -> Add New Marzban Node -> Show Certificate"
+  echo "Finish with Ctrl+D on a new line."
   echo
 
   umask 077
@@ -81,8 +74,6 @@ read_cert() {
     echo "Certificate does not look like PEM. File: ${CERT_FILE}"
     exit 1
   fi
-
-  echo "Saved: ${CERT_FILE}"
 }
 
 start_node() {
@@ -95,16 +86,16 @@ main() {
   need_root
   install_pkgs
   install_docker
-  clone_repo
   prepare_dirs
-  patch_compose
+  write_compose
   read_cert
   start_node
 
   echo
   echo "DONE."
-  echo "Logs:  cd ${NODE_DIR} && docker compose logs -f"
-  echo "Cert:  ${CERT_FILE}"
+  echo "Compose: ${COMPOSE_FILE}"
+  echo "Cert:   ${CERT_FILE}"
+  echo "Logs:   cd ${NODE_DIR} && docker compose logs -f"
 }
 
 main "$@"
